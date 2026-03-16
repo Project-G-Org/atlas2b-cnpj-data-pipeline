@@ -155,32 +155,67 @@ class Downloader:
         if self.config.keep_files and zip_path.exists() and zipfile.is_zipfile(zip_path):
             logger.debug(f"Using cached: {filename}")
         else:
-            # Download with retries
+            # Download with retries and resume support
             for attempt in range(self.config.retry_attempts):
                 try:
-                    logger.debug(f"Downloading {filename} (attempt {attempt + 1})")
+                    # Check how many bytes were already downloaded
+                    downloaded_bytes = zip_path.stat().st_size if zip_path.exists() else 0
+
+                    headers = {}
+                    if downloaded_bytes > 0:
+                        headers["Range"] = f"bytes={downloaded_bytes}-"
+                        logger.debug(f"Resuming {filename} from {downloaded_bytes} bytes (attempt {attempt + 1})")
+                    else:
+                        logger.debug(f"Downloading {filename} (attempt {attempt + 1})")
 
                     response = requests.get(
                         url,
                         auth=self.auth,
                         stream=True,
+                        headers=headers,
                         timeout=(self.config.connect_timeout, self.config.read_timeout),
                     )
                     response.raise_for_status()
 
-                    total_size = int(response.headers.get("content-length", 0))
+                    # 206 = Partial Content (resume supported), 200 = full file
+                    if response.status_code == 200:
+                        # Server didn't honor Range request, restart from scratch
+                        downloaded_bytes = 0
+                        total_size = int(response.headers.get("content-length", 0))
+                    else:
+                        # Server returned partial content (206)
+                        content_range = response.headers.get("content-range", "")
+                        if content_range:
+                            # Format: "bytes start-end/total"
+                            total_size = int(content_range.split("/")[-1])
+                        else:
+                            remaining = int(response.headers.get("content-length", 0))
+                            total_size = downloaded_bytes + remaining
+
+                    file_mode = "ab" if downloaded_bytes > 0 else "wb"
 
                     with tqdm(
                         total=total_size,
+                        initial=downloaded_bytes,
                         unit="B",
                         unit_scale=True,
                         desc=f"Downloading {filename}",
                         leave=False,
                     ) as pbar:
-                        with open(zip_path, "wb") as f:
-                            for chunk in response.iter_content(chunk_size=8192):
+                        with open(zip_path, file_mode) as f:
+                            for chunk in response.iter_content(chunk_size=131072):
                                 f.write(chunk)
                                 pbar.update(len(chunk))
+
+                    # Validate final file size if we know the expected total
+                    if total_size > 0 and zip_path.stat().st_size != total_size:
+                        logger.warning(
+                            f"Size mismatch for {filename}: "
+                            f"expected {total_size}, got {zip_path.stat().st_size}"
+                        )
+                        # Delete corrupt file so next attempt starts fresh
+                        zip_path.unlink(missing_ok=True)
+                        raise IOError(f"Downloaded file size mismatch for {filename}")
 
                     break
 
